@@ -3,6 +3,7 @@ import os
 import tempfile
 
 import pytest
+from ortools.sat.python import cp_model
 
 _tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _tmp.close()
@@ -11,6 +12,7 @@ os.environ["ADJ_DB_PATH"] = _tmp.name
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import database  # noqa: E402
+from app import solver as solver_pkg  # noqa: E402
 from app.main import app  # noqa: E402
 
 database.init_db()
@@ -273,3 +275,100 @@ def test_large_candidate_consensus_end_to_end():
     assert got["algorithm"]["version"] == body["algorithm_version"]
     assert "tie_break_method" in got["parameters"]
     assert len(got["consensus"]["adopted"]) == n - 1
+
+
+def test_feasible_not_optimal_is_persisted_and_reported_truthfully(monkeypatch):
+    """阶段 1 仅证可行（总分最高未证明）时：
+    接口照常落库但 solver_status=FEASIBLE，页面数据与报告都不得宣称最优；
+    始终无可行解时接口 409 且不落库。"""
+    pid = client.post("/api/projects", json={"name": "feasible-status"}).json()["id"]
+    n = 4
+    client.post(f"/api/projects/{pid}/documents", json={
+        "doc_id": "d",
+        "content": "ab" * n,
+        "token_bounds": [[2 * k, 2 * k + 2] for k in range(n)],
+    })
+    lab = client.post(f"/api/projects/{pid}/labels",
+                      json={"name": "ENT", "color": "#2563eb"}).json()["id"]
+    u1 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "子", "weight": 1}).json()["id"]
+    u2 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "丑", "weight": 1}).json()["id"]
+    client.post(f"/api/projects/{pid}/documents/d/annotations/batch", json={
+        "annotations": [
+            {"annotator_id": u, "label_id": lab, "start": 2 * k, "end": 2 * k + 2}
+            for u in (u1, u2) for k in range(n)
+        ],
+    })
+
+    # 分块大小设为 2，并把阶段 1 的状态篡改为 FEASIBLE（调用序号 0）
+    monkeypatch.setattr(solver_pkg, "TIE_BLOCK_SIZE", 2)
+    real_solve = cp_model.CpSolver.solve
+    call = {"n": 0}
+
+    def fake_solve(self, model):
+        idx = call["n"]
+        call["n"] += 1
+        status = real_solve(self, model)
+        return cp_model.FEASIBLE if idx == 0 else status
+
+    monkeypatch.setattr(cp_model.CpSolver, "solve", fake_solve)
+
+    con = client.post(f"/api/projects/{pid}/documents/d/consensus", json={})
+    assert con.status_code == 201, con.text
+    body = con.json()
+    assert body["solver_status"] == "FEASIBLE"          # 不得误报 OPTIMAL
+    assert all(it["adopted"] for it in body["items"])
+    assert body["total_score"] == 20 * n
+    assert "status_policy" in body["params"]
+
+    # 新报告如实携带 FEASIBLE，不宣称最优
+    rep = client.post(
+        f"/api/projects/{pid}/consensuses/{body['id']}/report", json={})
+    assert rep.status_code == 201, rep.text
+    assert rep.json()["solver"]["status"] == "FEASIBLE"
+
+    # 带理由覆盖后仍把快照交给 solve_consensus，状态同样如实入库
+    call["n"] = 0
+    ov = client.post(
+        f"/api/projects/{pid}/consensuses/{body['id']}/override", json={
+            "action": "deselect", "start": 0, "end": 2, "label_id": lab,
+            "reason": "FEASIBLE 状态传播回归",
+        })
+    assert ov.status_code == 201, ov.text
+    ob = ov.json()
+    assert ob["solver_status"] == "FEASIBLE"
+    assert sum(1 for it in ob["items"] if it["adopted"]) == n - 1
+    rep2 = client.post(
+        f"/api/projects/{pid}/consensuses/{ob['id']}/report", json={}).json()
+    assert rep2["solver"]["status"] == "FEASIBLE"
+
+
+def test_infeasible_solve_is_rejected_and_not_persisted(monkeypatch):
+    """始终无可行解：接口 409 拒绝，且不写入任何共识。"""
+    pid = client.post("/api/projects", json={"name": "infeasible"}).json()["id"]
+    client.post(f"/api/projects/{pid}/documents", json={
+        "doc_id": "d", "content": "ab",
+        "token_bounds": [[0, 1], [1, 2]],
+    })
+    lab = client.post(f"/api/projects/{pid}/labels",
+                      json={"name": "ENT", "color": "#2563eb"}).json()["id"]
+    u1 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "子", "weight": 1}).json()["id"]
+    u2 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "丑", "weight": 1}).json()["id"]
+    for u in (u1, u2):
+        r = client.post(f"/api/projects/{pid}/documents/d/annotations", json={
+            "annotator_id": u, "label_id": lab, "start": 0, "end": 1})
+        assert r.status_code == 201, r.text
+
+    # 让阶段 1 直接报 INFEASIBLE（模拟约束冲突下始终无可行解）
+    monkeypatch.setattr(
+        cp_model.CpSolver, "solve",
+        lambda self, model: cp_model.INFEASIBLE)
+
+    r = client.post(f"/api/projects/{pid}/documents/d/consensus", json={})
+    assert r.status_code == 409
+    listing = client.get(
+        f"/api/projects/{pid}/documents/d/consensuses").json()
+    assert listing == []

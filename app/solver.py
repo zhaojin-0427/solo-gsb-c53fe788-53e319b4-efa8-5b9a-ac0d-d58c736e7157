@@ -29,6 +29,17 @@ CP-SAT 的 2^62 系数上限（模型 INVALID），采用分阶段求解：
 阶段 1 最大化总得分；阶段 2 固定最优总分后，按候选排序分块
 （每块 TIE_BLOCK_SIZE 个）逐块最大化二进制权重和并锁定前序块，
 任意候选数下都严格等价于全局字典序裁决且整数系数安全。
+
+返回状态（status）严格反映「证明强度」，不允许把未证明的结论
+标成 OPTIMAL：
+    * OPTIMAL  —— 阶段 1 已证明全局总分最优，且阶段 2 的**每一个**
+                  平分块都已证明字典序裁决完成；
+    * FEASIBLE —— 持有已验证可行的解（并尽量完成了确定性平分
+                  裁决），但至少有一项未证明：阶段 1 仅得可行解
+                  （总分未必最高）、某平分块仅得可行解，或分块
+                  裁决中途失败（保留最后一个已验证可行解）；
+    * 其余状态 —— 始终未找到任何可行解，调用方（接口层）拒绝
+                  该次求解/覆盖且不落库。
 """
 from __future__ import annotations
 
@@ -39,7 +50,7 @@ from typing import Any
 from ortools.sat.python import cp_model
 
 ALGORITHM_NAME = "adj-cpsat-consensus"
-ALGORITHM_VERSION = "1.2.0"
+ALGORITHM_VERSION = "1.3.0"
 
 # 得分放大倍数：权重 1..10 的整数与 Dice 系数（一位小数量化）
 # 相乘后仍为整数，CP-SAT 只处理整数目标。
@@ -246,80 +257,141 @@ def solve_consensus(
         return sum(c.score * bv[c.index] for c in candidates)
 
     # ---- 阶段 1：在全部约束下最大化总得分 -------------------------------
-    status = cp_model.MODEL_INVALID
-    solver: cp_model.CpSolver | None = None
-    x: list = []
+    # 注意区分「最优性」与「可行性」：
+    #   * OPTIMAL  => 已证明返回解的总分是全局最高总分；
+    #   * FEASIBLE => 拿到了一个可行解（incumbent），但 CP-SAT 未能证明
+    #                 其总分最优（如超时）。此时 best_score 只是「已验证
+    #                 可行的最高总分」，并非最优总分上界。
+    # 阶段 1 仅 FEASIBLE 时仍可固定该已验证总分继续平分裁决：得到的是
+    # 「达到该可行总分的解中字典序最靠前」的确定解，但全局结果只能
+    # 标记为 FEASIBLE，绝不能因阶段 2 各块逐一证得最优而升级为 OPTIMAL。
+    phase1_status = cp_model.MODEL_INVALID
+    phase1_solver: cp_model.CpSolver | None = None
+    phase1_vars: list = []
     best_score = 0
     if n > 0:
         model, x = build_model()
         model.maximize(total_expr(x))
-        solver = new_solver()
-        status = solver.solve(model)
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        phase1_solver = new_solver()
+        phase1_status = phase1_solver.solve(model)
+        phase1_vars = x
+        if phase1_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             best_score = sum(
-                candidates[i].score for i in range(n) if solver.value(x[i])
+                candidates[i].score for i in range(n)
+                if phase1_solver.value(phase1_vars[i])
             )
 
-        # ---- 阶段 2：固定最优总分，分块严格裁决字典序平分 --------------
-        # 候选已按 (start,end,label_name,label_id) 排序；对每个块 B 最大化
-        # Σ_{k∈B} 2^(B-1-pos(k))·x[k]（二进制权重 ⇒ 块内严格字典序），
-        # 并锁定此前各块的加权和。块大小取 TIE_BLOCK_SIZE，最大权重
-        # 2^(B-1) 远低于 CP-SAT 的 2^62 系数上限；总分仅以 == 约束固定，
-        # 不再与任何大常数相乘，因此候选数无上限。
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            locked_sums: list[tuple[range, int]] = []
-            for lo in range(0, n, TIE_BLOCK_SIZE):
-                block = range(lo, min(lo + TIE_BLOCK_SIZE, n))
-                block_model, block_vars = build_model()
-                block_model.add(total_expr(block_vars) == best_score)
-                # 锁定此前各块在其最优字典序下的加权和
-                for fixed_range, fixed_sum in locked_sums:
-                    width = fixed_range.stop - fixed_range.start
-                    block_model.add(
-                        sum(
-                            (1 << (width - 1 - (k - fixed_range.start)))
-                            * block_vars[k]
-                            for k in fixed_range
-                        )
-                        == fixed_sum
-                    )
-                width = block.stop - block.start
-                block_model.maximize(
-                    sum(
-                        (1 << (width - 1 - (k - lo))) * block_vars[k]
-                        for k in block
-                    )
-                )
-                block_solver = new_solver()
-                block_status = block_solver.solve(block_model)
-                if block_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    # 理论上不可达：上一阶段（或前一块）的解满足
-                    # 总分==最优且前序块锁定，必为本块可行解。
-                    # 万一发生，保留上一个已求得的最优总分解
-                    # （前序块仍处于字典序最优），不再继续后续块。
-                    break
-                block_value = int(
-                    sum(
-                        (1 << (width - 1 - (k - lo)))
-                        * block_solver.value(block_vars[k])
-                        for k in block
-                    )
-                )
-                locked_sums.append((block, block_value))
-                solver, x, status = block_solver, block_vars, block_status
+    # 已验证可行的最优（incumbent）解：始终保留最近一个成功阶段返回的
+    # 可行赋值；某块求解失败时回退到此解，而不是沿用上一次赋值
+    # （块模型只是新建后未求解出结果，其变量没有可读的可行值）。
+    retained_solver = phase1_solver
+    retained_vars = phase1_vars
+    score_proven_optimal = phase1_status == cp_model.OPTIMAL
+    tie_break_complete = True   # 所有平分块是否均已证明裁决完成
 
-    feasible = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
-    chosen = [bool(solver.value(x[i])) for i in range(n)] if (feasible and n) else [False] * n
+    # ---- 阶段 2：固定已验证最高总分，分块严格裁决字典序平分 ------------
+    # 候选已按 (start,end,label_name,label_id) 排序；对每个块 B 最大化
+    # Σ_{k∈B} 2^(B-1-pos(k))·x[k]（二进制权重 ⇒ 块内严格字典序），
+    # 并锁定此前各块的加权和。块大小取 TIE_BLOCK_SIZE，最大权重
+    # 2^(B-1) 远低于 CP-SAT 的 2^62 系数上限；总分仅以 == 约束固定，
+    # 不再与任何大常数相乘，因此候选数无上限。
+    #
+    # 状态聚合规则（防止把未证明的结论误报为 OPTIMAL）：
+    #   * 块返回 OPTIMAL：锁定该块已证最优的加权和，继续后续块；
+    #   * 块仅返回 FEASIBLE（拿到赋值但未证最优）：锁定其已验证可行
+    #     的加权和并继续后续块——在该可行限制下仍可给出确定的字典序
+    #     选择——但平分裁决整体标记为「未完成」；
+    #   * 块连可行解都没有（UNKNOWN/INFEASIBLE/INVALID）：立即中断，
+    #     保留此前最后一个已验证可行解，后续块不再裁决，同样视为
+    #     「平分未完成」。
+    if phase1_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        locked_sums: list[tuple[range, int]] = []
+        for lo in range(0, n, TIE_BLOCK_SIZE):
+            block = range(lo, min(lo + TIE_BLOCK_SIZE, n))
+            block_model, block_vars = build_model()
+            block_model.add(total_expr(block_vars) == best_score)
+            # 锁定此前各块在其最优（或已验证可行）字典序下的加权和
+            for fixed_range, fixed_sum in locked_sums:
+                width = fixed_range.stop - fixed_range.start
+                block_model.add(
+                    sum(
+                        (1 << (width - 1 - (k - fixed_range.start)))
+                        * block_vars[k]
+                        for k in fixed_range
+                    )
+                    == fixed_sum
+                )
+            width = block.stop - block.start
+            block_model.maximize(
+                sum(
+                    (1 << (width - 1 - (k - lo))) * block_vars[k]
+                    for k in block
+                )
+            )
+            block_solver = new_solver()
+            block_status = block_solver.solve(block_model)
+            if block_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                # 理论上不可达：上一阶段（或前一块）的解满足
+                # 总分==固定值且前序块锁定，必为本块可行解。
+                # 万一发生，保留上一个已验证可行解（其前序块仍处于
+                # 已裁决状态），不再继续后续块。
+                tie_break_complete = False
+                break
+            block_value = int(
+                sum(
+                    (1 << (width - 1 - (k - lo)))
+                    * block_solver.value(block_vars[k])
+                    for k in block
+                )
+            )
+            locked_sums.append((block, block_value))
+            retained_solver = block_solver
+            retained_vars = block_vars
+            if block_status != cp_model.OPTIMAL:
+                # 本块仅证可行、未证最优：字典序裁决不能宣称完成。
+                tie_break_complete = False
+
+    if n > 0:
+        feasible = phase1_status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        # 只有「总分已证最优」且「每一个平分块都已证裁决完成」
+        # 才允许返回 OPTIMAL；其余只要持有可行解一律标 FEASIBLE。
+        if feasible and score_proven_optimal and tie_break_complete:
+            final_status = cp_model.OPTIMAL
+        elif feasible:
+            final_status = cp_model.FEASIBLE
+        else:
+            final_status = phase1_status
+        status_name = cp_model.CpSolverStatus(final_status).name
+        chosen_solver = retained_solver
+        chosen_vars = retained_vars
+    else:
+        # 无候选：空解天然可行且最优，保持与旧行为一致。
+        feasible = True
+        status_name = "OPTIMAL"
+        chosen_solver = None
+        chosen_vars = []
+
+    chosen = (
+        [bool(chosen_solver.value(chosen_vars[i])) for i in range(n)]
+        if (feasible and n) else [False] * n
+    )
     total_score = sum(candidates[i].score for i in range(n) if chosen[i])
     raw_total = round(total_score / SCORE_SCALE, 4)
+
+    # 正常失败（INFEASIBLE/INVALID）时 solver 也已执行真实求解、wall_time
+    # 可读；这里再兜底一层，避免求解器对象没有响应时取耗时抛错。
+    try:
+        wall_seconds = chosen_solver.wall_time if chosen_solver is not None else 0.0
+    except RuntimeError:
+        wall_seconds = 0.0
 
     return SolveResult(
         candidates=candidates,
         chosen=chosen,
         total_score=total_score,
         raw_total_score=raw_total,
-        status=solver.status_name(status) if solver is not None else "OPTIMAL",
-        wall_seconds=solver.wall_time if solver is not None else 0.0,
+        status=status_name,
+        wall_seconds=wall_seconds,
         objective_value=total_score,
         forced=forced,
         forced_out=forced_out,

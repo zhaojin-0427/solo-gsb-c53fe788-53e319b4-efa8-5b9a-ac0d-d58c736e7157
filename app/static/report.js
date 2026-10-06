@@ -126,7 +126,10 @@ async function openReport() {
         <dt>算法</dt><dd>${esc(payload.algorithm.name)} v${esc(payload.algorithm.version)}
           （应用版本 ${esc(payload.algorithm.app_version)}）</dd>
         <dt>求解状态</dt><dd>${esc(payload.solver.status)}，
-          总分（整数/原始）= ${payload.solver.total_score} / ${payload.solver.raw_total_score}</dd>
+          总分（整数/原始）= ${payload.solver.total_score} / ${payload.solver.raw_total_score}
+          ${payload.solver.status === "OPTIMAL"
+            ? '<span class="hint">（已证明总分最高且平分裁决完成）</span>'
+            : '<strong class="hint">（仅为已验证可行解，未证明总分最高；本报告不宣称其最优）</strong>'}</dd>
         <dt>内容摘要</dt><dd><code>SHA-256:${hash.slice(0, 24)}…</code>
           <span class="hint">（浏览器实时复算，与服务端入库摘要一致即未被篡改）</span></dd>
         <dt>不可变性</dt><dd class="hint">${esc(payload.immutability)}</dd>

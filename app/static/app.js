@@ -394,7 +394,7 @@ $("#solveBtn").addEventListener("click", async () => {
     state.consensus = c;
     renderConsensus();
     await refreshConsensusHistory(c.id);
-    toast(`求解完成：${c.solver_status}，总分 ${c.raw_total_score}`);
+    toast(`求解完成：${c.solver_status === "OPTIMAL" ? "已证明最优" : "仅可行、未证明最优"}（${c.solver_status}），总分 ${c.raw_total_score}`);
   } catch (e) { toast(e.message, true); }
 });
 
@@ -403,7 +403,7 @@ async function refreshConsensusHistory(pickId) {
     `/api/projects/${state.projectId}/documents/${encodeURIComponent(state.docId)}/consensuses`);
   const sel = $("#consensusHistory");
   sel.innerHTML = list.map((c) =>
-    `<option value="${c.id}">#${c.id} · v${c.revision} · 总分${c.raw_total_score} · ${c.created_at}</option>`
+    `<option value="${c.id}">#${c.id} · v${c.revision} · ${c.solver_status} · 总分${c.raw_total_score} · ${c.created_at}</option>`
   ).join("");
   if (pickId) sel.value = String(pickId);
 }
@@ -430,7 +430,10 @@ function renderConsensus() {
   }
   $("#solveMeta").textContent =
     `共识 #${c.id} · 算法 ${c.algorithm_name} v${c.algorithm_version} · ` +
-    `${c.solver_status} · 总分 ${c.raw_total_score} · ${c.created_at}`;
+    `${c.solver_status} · 总分 ${c.raw_total_score} · ${c.created_at}` +
+    (c.solver_status === "OPTIMAL"
+      ? ""
+      : `　⚠️ 仅为已验证可行解（${c.solver_status}），求解器未证明其总分最高，不应当作最优结果`);
   $("#solveParams").classList.remove("hidden");
   $("#solveParamsJson").textContent = JSON.stringify({
     algorithm: `${c.algorithm_name} v${c.algorithm_version}`,

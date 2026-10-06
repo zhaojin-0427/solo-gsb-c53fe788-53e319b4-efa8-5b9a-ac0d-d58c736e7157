@@ -227,9 +227,18 @@ def persist_consensus(conn, project_id: int, snapshot, params: SolveParams,
                 "contribution": "weight * label_match_weight * quantize(dice) / score_scale",
                 "tie_break": "lexicographic by (start,end,label_name,label_id)",
                 "tie_break_method": (
-                    "staged: maximize total score first, then fix it and maximize "
-                    f"blocked power-of-two binary weights (block_size={TIE_BLOCK_SIZE}); "
+                    "staged: maximize total score first, then fix the best verified "
+                    "score and maximize blocked power-of-two binary weights "
+                    f"(block_size={TIE_BLOCK_SIZE}); "
                     "safe 64-bit integer coefficients for any candidate count"
+                ),
+                "status_policy": (
+                    "OPTIMAL only when stage 1 proves the maximum total score AND "
+                    "every tie-break block is proved optimal; a verified feasible "
+                    "solution is returned as FEASIBLE (unproved total score, a "
+                    "merely feasible block, or interrupted block adjudication), "
+                    "and the request is rejected without persisting anything when "
+                    "no feasible solution exists"
                 ),
             }),
             db.dumps(snapshot),

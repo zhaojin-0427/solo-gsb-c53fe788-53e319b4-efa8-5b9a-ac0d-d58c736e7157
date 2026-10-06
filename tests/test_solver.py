@@ -1,4 +1,6 @@
 """求解器单元测试：评分、约束、平分确定性、覆盖可行性。"""
+from ortools.sat.python import cp_model
+
 import app.solver as solver_mod
 from app.solver import (
     InputAnnotation,
@@ -313,3 +315,115 @@ def test_override_still_works_with_many_candidates():
     assert res.chosen[by[(0, 2, 2)].index] is True
     assert res.chosen[by[(0, 2, 1)].index] is False
     assert sum(res.chosen) == 90  # 其余 89 个独立候选不受影响
+
+
+# ---------------------------------------------------------------------------
+# 分阶段求解最优性误报回归（v1.3）
+#
+# CP-SAT 的求解顺序是「阶段 1 一次 + 每个平分块一次」，每次都新建
+# CpSolver。以下用包装器按调用序号篡改状态：
+#   * 阶段 1 仅返回 FEASIBLE（持有可行解但未证总分最优）时，即使后续
+#     每个块都证得 OPTIMAL，最终状态也必须是 FEASIBLE；
+#   * 某个块仅返回 FEASIBLE 时，最终状态必须是 FEASIBLE，且仍给出
+#     确定性的可行解；
+#   * 某个块彻底失败（UNKNOWN）时中断裁决、保留此前最后一个已验证
+#     可行解，最终状态必须是 FEASIBLE；
+#   * 始终无可行解（覆盖冲突）时状态不是 OPTIMAL/FEASIBLE。
+# ---------------------------------------------------------------------------
+def _four_disjoint(monkeypatch, n=4):
+    """n 个互不重叠同标签候选；分块大小设为 2 => 阶段 2 共 ceil(n/2) 块。"""
+    monkeypatch.setattr(solver_mod, "TIE_BLOCK_SIZE", 2)
+    return _disjoint_candidates(n)
+
+
+def _patch_status(monkeypatch, forced):
+    """forced: {调用序号: 强制返回的 CP-SAT 状态}，其余调用保持真实结果。"""
+    real_solve = cp_model.CpSolver.solve
+    state = {"n": 0}
+
+    def wrapped(self, model):
+        idx = state["n"]
+        state["n"] += 1
+        status = real_solve(self, model)
+        return forced.get(idx, status)
+
+    monkeypatch.setattr(cp_model.CpSolver, "solve", wrapped)
+
+
+def test_stage1_merely_feasible_is_not_reported_optimal(monkeypatch):
+    annotations = _four_disjoint(monkeypatch)
+    _patch_status(monkeypatch, {0: cp_model.FEASIBLE})  # 阶段 1 仅可行
+    res = solve_consensus(annotations, set(), set())
+    # 总分与选择仍是已验证可行解，但不得宣称 OPTIMAL
+    assert res.status == "FEASIBLE"
+    assert sum(res.chosen) == 4
+    assert res.total_score == 4 * 20
+
+
+def test_merely_feasible_tie_block_is_not_reported_optimal(monkeypatch):
+    annotations = _four_disjoint(monkeypatch)
+    _patch_status(monkeypatch, {1: cp_model.FEASIBLE})  # 首个平分块仅可行
+    res = solve_consensus(annotations, set(), set())
+    assert res.status == "FEASIBLE"
+    # 锁定该块可行加权和后继续裁决，仍返回可行解
+    assert sum(res.chosen) == 4
+    assert res.total_score == 4 * 20
+
+
+def test_interrupted_block_keeps_last_verified_feasible_solution(monkeypatch):
+    annotations = _four_disjoint(monkeypatch)
+    _patch_status(monkeypatch, {2: cp_model.UNKNOWN})  # 第二个块求解失败
+    res = solve_consensus(annotations, set(), set())
+    # 中断平分裁决：保留阶段 1/前序块的已验证可行解，但状态必须降级
+    assert res.status == "FEASIBLE"
+    assert sum(res.chosen) == 4
+    assert res.total_score == 4 * 20
+
+
+def test_interrupted_block_with_tie_keeps_lexicographic_prefix(monkeypatch):
+    # 同标签重叠的等分配对 [0,2) vs [0,4)（dice=2/3→q7，二者同分 34），
+    # 加两个独立候选；分块大小 2 => 候选顺序 [0,2),[0,4),[6,8),[10,12)。
+    monkeypatch.setattr(solver_mod, "TIE_BLOCK_SIZE", 2)
+    annotations = [
+        ann(1, 0, 2, 1, 1), ann(2, 0, 2, 1, 1),
+        ann(1, 0, 4, 1, 1), ann(2, 0, 4, 1, 1),
+        ann(1, 6, 8, 1, 1), ann(2, 6, 8, 1, 1),
+        ann(1, 10, 12, 1, 1), ann(2, 10, 12, 1, 1),
+    ]
+    # 第二个块（候选 [6,8)/[10,12)）求解失败：第一块的字典序裁决
+    # （取 [0,2) 舍 [0,4)）必须保留。
+    _patch_status(monkeypatch, {2: cp_model.UNKNOWN})
+    res = solve_consensus(annotations, set(), set())
+    assert res.status == "FEASIBLE"
+    by = {(c.start, c.end, c.label_id): c for c in res.candidates}
+    assert res.chosen[by[(0, 2, 1)].index] is True
+    assert res.chosen[by[(0, 4, 1)].index] is False
+    # 已验证可行解满足全部约束；总分==74 的硬约束也强制两个独立候选入选
+    assert res.chosen[by[(6, 8, 1)].index] is True
+    assert res.chosen[by[(10, 12, 1)].index] is True
+    assert sum(res.chosen) == 3
+    assert res.total_score == 34 + 20 + 20
+
+
+def test_normal_proof_path_still_reports_optimal(monkeypatch):
+    # 不注入任何伪造状态：全部阶段证得最优 => OPTIMAL，且字典序结果不变
+    monkeypatch.setattr(solver_mod, "TIE_BLOCK_SIZE", 2)
+    annotations = _disjoint_candidates(5)
+    res = solve_consensus(annotations, set(), set())
+    assert res.status == "OPTIMAL"
+    assert sum(res.chosen) == 5
+    assert res.total_score == 5 * 20
+
+
+def test_no_feasible_solution_is_not_feasible_nor_optimal():
+    annotations = [
+        ann(1, 0, 2, 1, 8), ann(2, 0, 2, 1, 5),
+    ]
+    res = solve_consensus(
+        annotations, set(), set(), SolveParams(),
+        force_selected_keys={(0, 2, 1)},
+        force_deselected_keys={(0, 2, 1)},
+    )
+    assert res.status not in ("OPTIMAL", "FEASIBLE")
+    assert res.total_score == 0
+    assert not any(res.chosen)
