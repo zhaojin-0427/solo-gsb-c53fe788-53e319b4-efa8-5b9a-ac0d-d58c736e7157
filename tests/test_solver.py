@@ -8,6 +8,7 @@ from app.solver import (
     quantize_overlap,
     solve_consensus,
 )
+from ortools.sat.python import cp_model
 
 
 def ann(aid, start, end, lid, weight=5, name=None):
@@ -313,3 +314,131 @@ def test_override_still_works_with_many_candidates():
     assert res.chosen[by[(0, 2, 2)].index] is True
     assert res.chosen[by[(0, 2, 1)].index] is False
     assert sum(res.chosen) == 90  # 其余 89 个独立候选不受影响
+
+
+# ---------------------------------------------------------------------------
+# 分阶段求解的最优性误报回归：
+#   1. 阶段 1 仅 FEASIBLE（未证最高总分）时，后续块的 OPTIMAL 不得把整体
+#      状态抬成 OPTIMAL；保留阶段 1 已验证可行解并返回 FEASIBLE；
+#   2. 某平分块仅 FEASIBLE 时，平分未完成的事实必须保留（整体 FEASIBLE），
+#      采用该块的已验证可行解；
+#   3. 某块中途失败（UNKNOWN）时，保留此前最后一份已验证可行解，
+#      整体仍 FEASIBLE，且该解总分等于阶段 1 证明的最优总分。
+# 旧实现在这三种情况下都会把（可能未证最优的）结果标成 OPTIMAL。
+# ---------------------------------------------------------------------------
+class _ScriptedSolver:
+    """本次 solve() 返回预设状态；解值始终取真实 CP-SAT。"""
+
+    def __init__(self, real, forced_status=None):
+        self._real = real
+        self._forced = forced_status
+
+    def solve(self, model):
+        real_status = self._real.solve(model)
+        return self._forced if self._forced is not None else real_status
+
+    def value(self, var):
+        return self._real.value(var)
+
+    @property
+    def wall_time(self):
+        return self._real.wall_time
+
+    @staticmethod
+    def status_name(status):
+        return cp_model.CpSolver().status_name(status)
+
+
+def _install_scripted(monkeypatch, statuses):
+    """让 solve_consensus 内第 i 次 new_solver() 的 solve() 返回 statuses[i]；
+    超出预设序列的调用返回真实求解状态。"""
+    counter = {"n": 0}
+
+    def scripted_new_solver():
+        real = cp_model.CpSolver()
+        real.parameters.num_search_workers = 1
+        real.parameters.max_time_in_seconds = 30.0
+        real.parameters.random_seed = 42
+        i = counter["n"]
+        counter["n"] += 1
+        return _ScriptedSolver(real, statuses[i] if i < len(statuses) else None)
+
+    monkeypatch.setattr(solver_mod, "new_solver", scripted_new_solver)
+
+
+def test_stage1_feasible_is_not_reported_optimal(monkeypatch):
+    # 阶段 1 只给 FEASIBLE（如超时找到解但未证最高总分）。
+    _install_scripted(monkeypatch, [cp_model.FEASIBLE])
+    annotations = [
+        ann(1, 0, 2, 1, 8), ann(2, 0, 2, 1, 5), ann(3, 0, 2, 2, 3),
+        ann(1, 4, 6, 1, 8), ann(2, 4, 6, 1, 5), ann(3, 4, 6, 1, 3),
+    ]
+    res = solve_consensus(annotations, set(), {(1, 2)})
+    # 关键断言：不得因后续块 OPTIMAL 而误报 OPTIMAL
+    assert res.status == "FEASIBLE"
+    # 保留的是阶段 1 的已验证可行解：满足全部约束
+    assert any(res.chosen)
+    by = {(c.start, c.end, c.label_id): (c, res.chosen[i])
+          for i, c in enumerate(res.candidates)}
+    a, a_ok = by[(0, 2, 1)]
+    b, b_ok = by[(0, 2, 2)]
+    assert not (a_ok and b_ok)  # 互斥未被破坏
+
+
+def test_block_feasible_keeps_tie_unfinished_fact(monkeypatch):
+    # 阶段 1 OPTIMAL；第一个平分块只 FEASIBLE（块内字典序未证最优）。
+    # 旧代码把 status 直接覆写为该块状态——而该块真实求解实为 OPTIMAL，
+    # 故打桩强制其返回 FEASIBLE：只要平分块未证最优，整体就必须 FEASIBLE。
+    monkeypatch.setattr(solver_mod, "TIE_BLOCK_SIZE", 3)
+    _install_scripted(monkeypatch, [cp_model.OPTIMAL, cp_model.FEASIBLE])
+    annotations = [
+        ann(1, 0, 4, 1, 5), ann(2, 0, 4, 1, 5),
+        ann(1, 2, 6, 1, 5), ann(2, 2, 6, 1, 5),
+        ann(1, 8, 10, 1, 5), ann(2, 8, 10, 1, 5),
+        ann(1, 10, 12, 1, 5), ann(2, 10, 12, 1, 5),
+    ]
+    res = solve_consensus(annotations, set(), set())
+    assert res.status == "FEASIBLE"  # 平分块未证最优 => 整体不得称最优
+    # 保留的仍是已验证可行解（同标签重叠至多取一；独立候选可入选）
+    assert sum(res.chosen) >= 1
+    # 解必须满足同标签重叠至多取一
+    chosen = [c for c, ok in zip(res.candidates, res.chosen) if ok]
+    for i, a in enumerate(chosen):
+        for b in chosen[i + 1:]:
+            assert not (a.start < b.end and b.start < a.end)
+
+
+def test_block_failure_falls_back_to_last_verified_solution(monkeypatch):
+    # 阶段 1 OPTIMAL；块 1 OPTIMAL；块 2 中途失败（UNKNOWN）。
+    monkeypatch.setattr(solver_mod, "TIE_BLOCK_SIZE", 3)
+    _install_scripted(
+        monkeypatch,
+        [cp_model.OPTIMAL, cp_model.OPTIMAL, cp_model.UNKNOWN],
+    )
+    rng_anns = []
+    # 构造 10 个互不重叠的独立候选（跨 4 个块），各有正分
+    for k in range(10):
+        s = 2 * k
+        rng_anns += [ann(1, s, s + 2, 1, 5), ann(2, s, s + 2, 1, 5)]
+    res = solve_consensus(rng_anns, set(), set())
+    assert res.status == "FEASIBLE"          # 不得误报 OPTIMAL
+    # 回退解必须可行且总分仍为阶段 1 证明的最优总分
+    assert all(res.chosen)                   # 互不重叠 => 全部可入选
+    assert res.total_score == sum(c.score for c in res.candidates)
+
+
+def test_all_optimal_blocks_still_report_optimal(monkeypatch):
+    # 对照组：阶段 1 与各块全部 OPTIMAL 时，状态仍为 OPTIMAL，
+    # 且字典序裁决结果与不打桩时完全一致。
+    monkeypatch.setattr(solver_mod, "TIE_BLOCK_SIZE", 3)
+    n_blocks = 4
+    _install_scripted(monkeypatch, [cp_model.OPTIMAL] * (n_blocks + 1))
+    annotations = [
+        ann(1, 0, 4, 1, 5), ann(2, 0, 4, 1, 5),
+        ann(1, 2, 6, 1, 5), ann(2, 2, 6, 1, 5),
+        ann(1, 8, 10, 1, 5), ann(2, 8, 10, 1, 5),
+    ]
+    res = solve_consensus(annotations, set(), set())
+    assert res.status == "OPTIMAL"
+    starts = [c.start for c, ok in zip(res.candidates, res.chosen) if ok]
+    assert 0 in starts and 2 not in starts and 8 in starts

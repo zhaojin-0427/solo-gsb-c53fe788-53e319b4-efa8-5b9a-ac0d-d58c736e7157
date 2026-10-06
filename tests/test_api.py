@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app import database  # noqa: E402
 from app.main import app  # noqa: E402
+from ortools.sat.python import cp_model  # noqa: E402
 
 database.init_db()
 client = TestClient(app)
@@ -273,3 +274,124 @@ def test_large_candidate_consensus_end_to_end():
     assert got["algorithm"]["version"] == body["algorithm_version"]
     assert "tie_break_method" in got["parameters"]
     assert len(got["consensus"]["adopted"]) == n - 1
+
+
+# ---------------------------------------------------------------------------
+# 分阶段求解最优性误报的端到端回归
+# ---------------------------------------------------------------------------
+class _ScriptedSolver:
+    """按序返回预设求解状态，解值始终取自真实 CP-SAT。"""
+
+    def __init__(self, real, forced, counter):
+        self._real = real
+        self._forced = forced
+        self._c = counter
+
+    def solve(self, model):
+        real_status = self._real.solve(model)
+        i = self._c[0]
+        self._c[0] += 1
+        return self._forced[i] if i < len(self._forced) else real_status
+
+    def value(self, var):
+        return self._real.value(var)
+
+    @property
+    def wall_time(self):
+        return self._real.wall_time
+
+    def status_name(self, status=None):
+        return self._real.status_name(status)
+
+
+def _force_solver_statuses(monkeypatch, statuses):
+    import app.solver as solver_mod
+
+    counter = [0]
+
+    def scripted_new_solver():
+        real = cp_model.CpSolver()
+        real.parameters.num_search_workers = 1
+        real.parameters.max_time_in_seconds = 30.0
+        real.parameters.random_seed = 42
+        return _ScriptedSolver(real, statuses, counter)
+
+    monkeypatch.setattr(solver_mod, "new_solver", scripted_new_solver)
+
+
+def _make_simple_project(name):
+    pid = client.post("/api/projects", json={"name": name}).json()["id"]
+    client.post(f"/api/projects/{pid}/documents", json={
+        "doc_id": "d1", "content": "ab", "token_bounds": [[0, 1], [1, 2]]})
+    lab = client.post(f"/api/projects/{pid}/labels",
+                      json={"name": "E", "color": "#2563eb"}).json()["id"]
+    u1 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "子", "weight": 5}).json()["id"]
+    u2 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "丑", "weight": 5}).json()["id"]
+    for who in (u1, u2):
+        r = client.post(f"/api/projects/{pid}/documents/d1/annotations", json={
+            "annotator_id": who, "label_id": lab, "start": 0, "end": 1})
+        assert r.status_code == 201, r.text
+    return pid, lab
+
+
+def test_feasible_consensus_persisted_and_report_does_not_claim_optimal(
+        monkeypatch):
+    """阶段 1 仅 FEASIBLE：接口仍 201 落库（有可行解），但状态为 FEASIBLE，
+    列表/详情/报告均不得宣称最优。"""
+    _force_solver_statuses(monkeypatch, [cp_model.FEASIBLE])
+    pid, _ = _make_simple_project("feasible-status")
+
+    r = client.post(f"/api/projects/{pid}/documents/d1/consensus", json={})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["solver_status"] == "FEASIBLE"
+    assert body["params"]["status_semantics"]
+
+    # 列表同样如实展示 FEASIBLE
+    listing = client.get(
+        f"/api/projects/{pid}/documents/d1/consensuses").json()
+    assert any(c["id"] == body["id"] and c["solver_status"] == "FEASIBLE"
+               for c in listing)
+
+    # 新报告固化 FEASIBLE 且显式标注未证明最优
+    rep = client.post(
+        f"/api/projects/{pid}/consensuses/{body['id']}/report", json={})
+    assert rep.status_code == 201, rep.text
+    rb = rep.json()
+    assert rb["solver"]["status"] == "FEASIBLE"
+    assert rb["solver"]["optimality_proven"] is False
+
+
+def test_infeasible_solve_rejected_and_not_persisted(monkeypatch):
+    """始终无可行解：求解接口拒绝（409）且不落库任何共识。"""
+    _force_solver_statuses(monkeypatch, [cp_model.INFEASIBLE])
+    pid, _ = _make_simple_project("infeasible-status")
+
+    r = client.post(f"/api/projects/{pid}/documents/d1/consensus", json={})
+    assert r.status_code == 409
+    assert client.get(
+        f"/api/projects/{pid}/documents/d1/consensuses").json() == []
+
+
+def test_infeasible_override_rejected_and_not_persisted(monkeypatch):
+    """覆盖后无解：覆盖接口 409，且不产生新共识版本。"""
+    pid, lab = _make_simple_project("infeasible-override")
+    con = client.post(
+        f"/api/projects/{pid}/documents/d1/consensus", json={}).json()
+    before = client.get(
+        f"/api/projects/{pid}/documents/d1/consensuses").json()
+    assert len(before) == 1
+
+    # 同一候选既强制采纳又强制否决 => 模型不可行（API 层有预检，
+    # 故直接构造求解器返回 INFEASIBLE 的场景：否决唯一候选）
+    _force_solver_statuses(monkeypatch, [cp_model.INFEASIBLE])
+    r = client.post(
+        f"/api/projects/{pid}/consensuses/{con['id']}/override", json={
+            "action": "deselect", "start": 0, "end": 1, "label_id": lab,
+            "reason": "求解器不可行回归"})
+    assert r.status_code == 409
+    after = client.get(
+        f"/api/projects/{pid}/documents/d1/consensuses").json()
+    assert [c["id"] for c in after] == [con["id"]]  # 未新增共识版本

@@ -52,6 +52,14 @@ function annotatorById(id) {
   return state.annotators.find((a) => a.id === id) || { name: `#${id}`, weight: "?" };
 }
 
+// 求解状态中文化：只有 OPTIMAL 才是「已证最优」；FEASIBLE 仅为可行解，
+// 总分或字典序平分尚未证明最优，页面不得将其宣称为最优。
+function statusLabel(status) {
+  if (status === "OPTIMAL") return "OPTIMAL（已证最优）";
+  if (status === "FEASIBLE") return "FEASIBLE（可行，未证明最优）";
+  return esc(String(status ?? ""));
+}
+
 // 在文本上叠加多层（可嵌套）标注高亮，按长度从外到内用栈渲染
 function renderHighlighted(hostEl, text, spans) {
   if (!text) {
@@ -394,7 +402,7 @@ $("#solveBtn").addEventListener("click", async () => {
     state.consensus = c;
     renderConsensus();
     await refreshConsensusHistory(c.id);
-    toast(`求解完成：${c.solver_status}，总分 ${c.raw_total_score}`);
+    toast(`求解完成：${statusLabel(c.solver_status)}，总分 ${c.raw_total_score}`);
   } catch (e) { toast(e.message, true); }
 });
 
@@ -430,7 +438,7 @@ function renderConsensus() {
   }
   $("#solveMeta").textContent =
     `共识 #${c.id} · 算法 ${c.algorithm_name} v${c.algorithm_version} · ` +
-    `${c.solver_status} · 总分 ${c.raw_total_score} · ${c.created_at}`;
+    `${statusLabel(c.solver_status)} · 总分 ${c.raw_total_score} · ${c.created_at}`;
   $("#solveParams").classList.remove("hidden");
   $("#solveParamsJson").textContent = JSON.stringify({
     algorithm: `${c.algorithm_name} v${c.algorithm_version}`,

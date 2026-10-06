@@ -231,6 +231,10 @@ def persist_consensus(conn, project_id: int, snapshot, params: SolveParams,
                     f"blocked power-of-two binary weights (block_size={TIE_BLOCK_SIZE}); "
                     "safe 64-bit integer coefficients for any candidate count"
                 ),
+                "status_semantics": (
+                    "OPTIMAL only if the total score AND every tie-break block were "
+                    "proven optimal; a feasible but unproven result is reported FEASIBLE"
+                ),
             }),
             db.dumps(snapshot),
             db.utcnow(),
@@ -768,6 +772,7 @@ def create_report(project_id: int, consensus_id: int):
             "parameters": consensus["params"],
             "solver": {
                 "status": consensus["solver_status"],
+                "optimality_proven": consensus["solver_status"] == "OPTIMAL",
                 "total_score": consensus["total_score"],
                 "raw_total_score": consensus["raw_total_score"],
             },

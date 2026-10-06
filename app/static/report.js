@@ -18,6 +18,14 @@ async function getJson(path) {
   return res.json();
 }
 
+// 只有 OPTIMAL 才允许报告宣称为最优；FEASIBLE 仅表示存在已验证可行解，
+// 总分或字典序平分未证最优，必须如实展示。
+function statusLabel(status) {
+  if (status === "OPTIMAL") return "OPTIMAL（已证最优）";
+  if (status === "FEASIBLE") return "FEASIBLE（可行，未证明最优）";
+  return esc(String(status ?? ""));
+}
+
 async function loadProjectOptions() {
   const projects = await getJson("/api/projects");
   $("#reportProject").innerHTML = projects.map((p) =>
@@ -125,7 +133,10 @@ async function openReport() {
           · ${snap.char_count} 字符 · ${snap.token_bounds.length} 词元</dd>
         <dt>算法</dt><dd>${esc(payload.algorithm.name)} v${esc(payload.algorithm.version)}
           （应用版本 ${esc(payload.algorithm.app_version)}）</dd>
-        <dt>求解状态</dt><dd>${esc(payload.solver.status)}，
+        <dt>求解状态</dt><dd>${statusLabel(payload.solver.status)}
+          ${payload.solver.optimality_proven === false
+            ? '<span class="hint">（本报告仅固化一份可行共识，未证明其为最高总分）</span>'
+            : ""}，
           总分（整数/原始）= ${payload.solver.total_score} / ${payload.solver.raw_total_score}</dd>
         <dt>内容摘要</dt><dd><code>SHA-256:${hash.slice(0, 24)}…</code>
           <span class="hint">（浏览器实时复算，与服务端入库摘要一致即未被篡改）</span></dd>
